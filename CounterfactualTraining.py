@@ -1,6 +1,3 @@
-# ======================================================
-# Colab: SGCT with GPT-2 + HPM only (recommended values)
-# ======================================================
 !pip install -q transformers datasets scikit-learn
 
 import os, json, random, numpy as np, torch, torch.nn.functional as F
