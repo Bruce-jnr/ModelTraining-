@@ -1,581 +1,406 @@
-import json
-import pandas as pd
+# ==============================================
+# Colab Training Script (uses your .env values inline)
+# ==============================================
+
+!pip install -q transformers datasets scikit-learn python-dotenv tqdm matplotlib
+
+import os, json, warnings, re
 import numpy as np
+import pandas as pd
+from pathlib import Path
+from typing import Any, Dict, List
+
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+
 from transformers import (
-    DistilBertTokenizer,
+    DistilBertTokenizerFast,
     DistilBertForSequenceClassification,
-    get_linear_schedule_with_warmup
+    get_linear_schedule_with_warmup,
 )
+
 from torch.optim import AdamW
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, precision_recall_fscore_support, roc_auc_score
-import os
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support, roc_auc_score, classification_report
+from sklearn.exceptions import UndefinedMetricWarning
+
 import logging
 from tqdm import tqdm
 import matplotlib.pyplot as plt
-from datetime import datetime
-from dotenv import load_dotenv
 
-# Set up logging
+# =========================
+# Inline ".env" configuration (your values)
+# =========================
+DATASET_PATH = "/content/drive/MyDrive/Colab Notebooks/dataset.json"
+MODEL_NAME   = "distilbert-base-uncased"
+BATCH_SIZE   = 8
+LEARNING_RATE= 2e-5
+EPOCHS       = 3
+PATIENCE     = 3
+
+# Where to save checkpoints and final model (into Drive so they persist)
+CHECKPOINT_DIR = "/content/drive/MyDrive/Colab Notebooks/CheckPoints/hallucination_detector_checkpoints"
+FINAL_DIR      = "/content/drive/MyDrive/Colab Notebooks/NewBestModel/hallucination_detector_final"
+
+# =========================
+# (Optional) Mount Drive
+# =========================
+from google.colab import drive
+drive.mount('/content/drive')
+
+# =========================
+# Logging
+# =========================
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("_main_")
 
-
+# =========================
+# Dataset
+# =========================
 class HallucinationDataset(Dataset):
-    """Custom dataset for hallucination detection"""
-
-    def __init__(self, data, tokenizer, max_length=512):
-        self.data = data
-        self.tokenizer = tokenizer
-        self.max_length = max_length
+    """
+    Returns raw fields so the collator can do dynamic pair tokenization.
+    """
+    def __init__(self, df: pd.DataFrame):
+        self.df = df.reset_index(drop=True)
 
     def __len__(self):
-        return len(self.data)
+        return len(self.df)
 
     def __getitem__(self, idx):
-        item = self.data.iloc[idx]
-
-        # Format: [CLS] question [SEP] answer
-        text = f"{item['question']} [SEP] {item['answer']}"
-
-        encoding = self.tokenizer(
-            text,
-            truncation=True,
-            padding='max_length',
-            max_length=self.max_length,
-            return_tensors='pt'
-        )
-
+        row = self.df.iloc[idx]
         return {
-            'input_ids': encoding['input_ids'].flatten(),
-            'attention_mask': encoding['attention_mask'].flatten(),
-            'labels': torch.tensor(item['label'], dtype=torch.long)
+            "question": str(row.get("question", "")),
+            "answer": str(row.get("answer", "")),
+            "evidence": str(row.get("evidence", "")) if pd.notna(row.get("evidence", "")) else "",
+            "label": int(row.get("label", 0)),
         }
 
+class PairCollator:
+    """
+    Dynamic padding; uses (left: question [+ evidence]), (right: answer).
+    DistilBERT ignores token_type_ids, but paired inputs still help boundaries/truncation.
+    """
+    def __init__(self, tokenizer, max_length=256, use_evidence=True):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.use_evidence = use_evidence
 
+    def __call__(self, batch):
+        lefts, rights, labels = [], [], []
+        for b in batch:
+            q = b["question"] if isinstance(b["question"], str) else ""
+            e = b.get("evidence", "")
+            if self.use_evidence and isinstance(e, str) and e.strip():
+                left = f"Q: {q}  EVIDENCE: {e}"
+            else:
+                left = q
+            right = b["answer"] if isinstance(b["answer"], str) else ""
+            lefts.append(left)
+            rights.append(right)
+            labels.append(int(b["label"]))
+
+        enc = self.tokenizer(
+            lefts, rights,
+            truncation=True,
+            max_length=self.max_length,
+            padding=True,                # dynamic padding
+            return_tensors="pt",
+        )
+        return {
+            "input_ids": enc["input_ids"],
+            "attention_mask": enc["attention_mask"],
+            "labels": torch.tensor(labels, dtype=torch.long),
+        }
+
+# =========================
+# Data Preprocessor
+# =========================
 class DataPreprocessor:
-    """Handles dataset preparation and preprocessing"""
+    def load_merged_dataset(self, dataset_path: str) -> pd.DataFrame:
+        if not Path(dataset_path).exists():
+            raise FileNotFoundError(f"Dataset file not found at: {dataset_path}")
+        with open(dataset_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        df = pd.DataFrame(data)
 
-    def __init__(self):
-        self.tokenizer = DistilBertTokenizer.from_pretrained('distilbert-base-uncased')
+        # Basic checks
+        required = ["question", "answer", "label"]
+        for col in required:
+            if col not in df.columns:
+                raise ValueError(f"Required column '{col}' not found in dataset")
 
-    def load_merged_dataset(self, dataset_path):
-        """Load the pre-merged FEVER and TruthfulQA dataset"""
-        try:
-            with open(dataset_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
+        if "evidence" not in df.columns:
+            df["evidence"] = ""
 
-            # Convert to DataFrame
-            df = pd.DataFrame(data)
+        # Clean types
+        df["question"] = df["question"].astype(str)
+        df["answer"]   = df["answer"].astype(str)
+        df["evidence"] = df["evidence"].fillna("").astype(str)
+        df["label"]    = df["label"].astype(int)
 
-            # Ensure we have the required columns
-            required_columns = ['question', 'answer', 'label']
-            for col in required_columns:
-                if col not in df.columns:
-                    raise ValueError(f"Required column '{col}' not found in dataset")
+        logger.info(f"Loaded dataset with {len(df)} samples")
+        logger.info(f"Columns: {list(df.columns)}")
 
-            # Add evidence column if not present (though it should be there)
-            if 'evidence' not in df.columns:
-                df['evidence'] = ''
+        if "source" in df.columns:
+            logger.info(f"Source distribution: {df['source'].value_counts().to_dict()}")
 
-            # Log dataset statistics
-            logger.info(f"Loaded dataset with {len(df)} samples")
-            logger.info(f"Columns: {list(df.columns)}")
+        dist = df["label"].value_counts().to_dict()
+        logger.info(f"Label distribution: {dist}")
+        logger.info(f"  Label 1 (Factual): {dist.get(1,0)} samples ({dist.get(1,0)/len(df)*100:.1f}%)")
+        logger.info(f"  Label 0 (Hallucinated): {dist.get(0,0)} samples ({dist.get(0,0)/len(df)*100:.1f}%)")
 
-            # Show distribution by source if available
-            if 'source' in df.columns:
-                source_dist = df['source'].value_counts()
-                logger.info(f"Source distribution: {source_dist.to_dict()}")
+        # Drop exact-NA rows
+        before = len(df)
+        df = df.dropna()
+        logger.info(f"Dataset after cleaning: {len(df)} samples (dropped {before-len(df)})")
+        return df
 
-            # Show label distribution
-            label_dist = df['label'].value_counts()
-            logger.info(f"Label distribution: {label_dist.to_dict()}")
-            logger.info(
-                f"  Label 1 (Factual): {label_dist.get(1, 0)} samples ({label_dist.get(1, 0) / len(df) * 100:.1f}%)")
-            logger.info(
-                f"  Label 0 (Hallucinated): {label_dist.get(0, 0)} samples ({label_dist.get(0, 0) / len(df) * 100:.1f}%)")
-
-            # Show sample data
-            logger.info("Sample entries:")
-            for i, sample in enumerate(df.head(2).to_dict('records')):
-                logger.info(f"  Sample {i + 1}: {sample}")
-
-            return df
-
-        except Exception as e:
-            logger.error(f"Error loading dataset from {dataset_path}: {str(e)}")
-            raise
-
-    def merge_datasets(self, fever_path=None, truthfulqa_path=None,
-                       fever_df=None, truthfulqa_df=None):
-        """Merge FEVER and TruthfulQA datasets"""
-
-        if fever_df is None and fever_path:
-            fever_df = self.load_fever_data(fever_path)
-        if truthfulqa_df is None and truthfulqa_path:
-            truthfulqa_df = self.load_truthfulqa_data(truthfulqa_path)
-
-        # Merge datasets
-        merged_data = pd.concat([fever_df, truthfulqa_df], ignore_index=True)
-
-        # Shuffle the dataset
-        merged_data = merged_data.sample(frac=1, random_state=42).reset_index(drop=True)
-
-        # Clean data
-        merged_data = merged_data.dropna()
-
-        logger.info(f"Merged dataset size: {len(merged_data)}")
-        logger.info(f"Class distribution: {merged_data['label'].value_counts().to_dict()}")
-
-        return merged_data
-
-    def stratified_split(self, data, train_size=0.7, val_size=0.15, test_size=0.15):
-        """Perform stratified split maintaining class balance"""
-
-        assert abs(train_size + val_size + test_size - 1.0) < 1e-6, "Split sizes must sum to 1.0"
-
-        # First split: separate train from (val + test)
-        X = data.drop('label', axis=1)
-        y = data['label']
-
+    def stratified_split(self, df: pd.DataFrame, train=0.7, val=0.15, test=0.15):
+        assert abs(train + val + test - 1.0) < 1e-6, "Splits must sum to 1.0"
+        X = df.drop(columns=["label"])
+        y = df["label"]
         X_train, X_temp, y_train, y_temp = train_test_split(
-            X, y, test_size=(val_size + test_size),
-            stratify=y, random_state=42
+            X, y, test_size=(val+test), stratify=y, random_state=42
         )
-
-        # Second split: separate val from test
         X_val, X_test, y_val, y_test = train_test_split(
-            X_temp, y_temp,
-            test_size=test_size / (val_size + test_size),
-            stratify=y_temp, random_state=42
+            X_temp, y_temp, test_size=test/(val+test), stratify=y_temp, random_state=42
         )
+        train_df = pd.concat([X_train, y_train], axis=1)
+        val_df   = pd.concat([X_val, y_val], axis=1)
+        test_df  = pd.concat([X_test, y_test], axis=1)
 
-        # Recombine features and labels
-        train_data = pd.concat([X_train, y_train], axis=1)
-        val_data = pd.concat([X_val, y_val], axis=1)
-        test_data = pd.concat([X_test, y_test], axis=1)
+        logger.info(f"Train size: {len(train_df)} ({len(train_df)/len(df)*100:.1f}%)")
+        logger.info(f"Val size:   {len(val_df)} ({len(val_df)/len(df)*100:.1f}%)")
+        logger.info(f"Test size:  {len(test_df)} ({len(test_df)/len(df)*100:.1f}%)")
+        for name, d in [("Train", train_df), ("Val", val_df), ("Test", test_df)]:
+            logger.info(f"{name} class distribution: {d['label'].value_counts(normalize=True).to_dict()}")
+        return train_df, val_df, test_df
 
-        logger.info(f"Train size: {len(train_data)} ({len(train_data) / len(data) * 100:.1f}%)")
-        logger.info(f"Val size: {len(val_data)} ({len(val_data) / len(data) * 100:.1f}%)")
-        logger.info(f"Test size: {len(test_data)} ({len(test_data) / len(data) * 100:.1f}%)")
-
-        # Log class distributions
-        for name, dataset in [("Train", train_data), ("Val", val_data), ("Test", test_data)]:
-            dist = dataset['label'].value_counts(normalize=True)
-            logger.info(f"{name} class distribution: {dist.to_dict()}")
-
-        return train_data, val_data, test_data
-
-
+# =========================
+# Trainer
+# =========================
 class HallucinationDetectorTrainer:
-    """Main trainer class for the hallucination detector"""
-
-    def __init__(self, model_name='distilbert-base-uncased', max_length=512):
+    def __init__(self, model_name=MODEL_NAME, max_length=256):
         self.model_name = model_name
         self.max_length = max_length
-        self.tokenizer = DistilBertTokenizer.from_pretrained(model_name)
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-        # Training history
-        self.train_losses = []
-        self.val_losses = []
-        self.val_f1_scores = []
-        self.val_accuracies = []
-
-        # Early stopping parameters
-        self.best_f1 = 0
-        self.patience_counter = 0
-
-    def create_data_loaders(self, train_data, val_data, test_data, batch_size=8):
-        """Create data loaders for training, validation, and testing"""
-
-        train_dataset = HallucinationDataset(train_data, self.tokenizer, self.max_length)
-        val_dataset = HallucinationDataset(val_data, self.tokenizer, self.max_length)
-        test_dataset = HallucinationDataset(test_data, self.tokenizer, self.max_length)
-
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-
-        return train_loader, val_loader, test_loader
-
-    def initialize_model(self):
-        """Initialize the DistilBERT model for sequence classification"""
+        self.tokenizer = DistilBertTokenizerFast.from_pretrained(model_name)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self.model = DistilBertForSequenceClassification.from_pretrained(
-            self.model_name,
+            model_name,
             num_labels=2,
             id2label={0: "HALLUCINATED", 1: "FACTUAL"},
-            label2id={"HALLUCINATED": 0, "FACTUAL": 1}
-        )
-        self.model.to(self.device)
+            label2id={"HALLUCINATED": 0, "FACTUAL": 1},
+        ).to(self.device)
 
-        return self.model
+        # tracking
+        self.train_losses, self.val_losses = [], []
+        self.val_f1_scores, self.val_accuracies = [], []
+        self.best_f1, self.patience_counter = 0.0, 0
 
-    def setup_optimizer_scheduler(self, train_loader, epochs=None, lr=None):
-        """Setup optimizer and learning rate scheduler"""
+    def create_loaders(self, train_df, val_df, test_df, batch_size=BATCH_SIZE):
+        train_ds = HallucinationDataset(train_df)
+        val_ds   = HallucinationDataset(val_df)
+        test_ds  = HallucinationDataset(test_df)
 
-        # Get hyperparameters from environment variables with defaults
-        if epochs is None:
-            epochs = int(os.getenv('EPOCHS', 3))
-        if lr is None:
-            lr = float(os.getenv('LEARNING_RATE', 2e-5))
+        self.collator = PairCollator(self.tokenizer, max_length=self.max_length, use_evidence=True)
 
-        logger.info(f"Training configuration:")
-        logger.info(f"  Epochs: {epochs}")
-        logger.info(f"  Learning Rate: {lr}")
+        pin = (self.device.type == "cuda")
+        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
+                                  collate_fn=self.collator, pin_memory=pin, num_workers=2)
+        val_loader   = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
+                                  collate_fn=self.collator, pin_memory=pin, num_workers=2)
+        test_loader  = DataLoader(test_ds, batch_size=batch_size, shuffle=False,
+                                  collate_fn=self.collator, pin_memory=pin, num_workers=2)
+        return train_loader, val_loader, test_loader
 
-        self.optimizer = AdamW(
-            self.model.parameters(),
-            lr=lr,
-            weight_decay=0.01
-        )
-
+    def setup_optim(self, train_loader, epochs=EPOCHS, lr=LEARNING_RATE):
+        self.optimizer = AdamW(self.model.parameters(), lr=lr, weight_decay=0.01)
         total_steps = len(train_loader) * epochs
+        warmup = max(1, int(0.1 * total_steps))  # 10% warmup
         self.scheduler = get_linear_schedule_with_warmup(
-            self.optimizer,
-            num_warmup_steps=0,
-            num_training_steps=total_steps
+            self.optimizer, num_warmup_steps=warmup, num_training_steps=total_steps
         )
-
         return epochs, lr
 
-    def compute_metrics(self, predictions, labels):
-        """Compute evaluation metrics"""
+    def _metrics(self, logits: np.ndarray, labels: np.ndarray) -> Dict[str, float]:
+        preds = np.argmax(logits, axis=1)
+        prec, rec, f1, _ = precision_recall_fscore_support(labels, preds, average="binary", pos_label=1, zero_division=0)
+        acc = accuracy_score(labels, preds)
+        # AUC (safe)
+        try:
+            probs = torch.softmax(torch.tensor(logits), dim=1)[:, 1].numpy()
+            auc = roc_auc_score(labels, probs)
+        except ValueError:
+            auc = float("nan")
+        return {"accuracy": float(acc), "precision": float(prec), "recall": float(rec), "f1": float(f1), "auc": float(auc)}
 
-        preds = np.argmax(predictions, axis=1)
-        precision, recall, f1, _ = precision_recall_fscore_support(
-            labels, preds, average='binary', pos_label=1
-        )
-        accuracy = accuracy_score(labels, preds)
-
-        # Compute AUC
-        probs = torch.softmax(torch.tensor(predictions), dim=1)[:, 1].numpy()
-        auc = roc_auc_score(labels, probs)
-
-        return {
-            'accuracy': accuracy,
-            'precision': precision,
-            'recall': recall,
-            'f1': f1,
-            'auc': auc
-        }
-
-    def validate(self, val_loader):
-        """Validation step"""
-
+    @torch.no_grad()
+    def _validate(self, val_loader):
         self.model.eval()
-        total_val_loss = 0
-        predictions = []
-        true_labels = []
+        total_loss, outs, labs = 0.0, [], []
+        for batch in tqdm(val_loader, desc="Validating", leave=False):
+            input_ids = batch["input_ids"].to(self.device)
+            attn      = batch["attention_mask"].to(self.device)
+            labels    = batch["labels"].to(self.device)
 
-        with torch.no_grad():
-            for batch in tqdm(val_loader, desc="Validating"):
-                input_ids = batch['input_ids'].to(self.device)
-                attention_mask = batch['attention_mask'].to(self.device)
-                labels = batch['labels'].to(self.device)
+            outputs = self.model(input_ids=input_ids, attention_mask=attn, labels=labels)
+            total_loss += outputs.loss.item()
+            outs.append(outputs.logits.detach().cpu().numpy())
+            labs.append(labels.detach().cpu().numpy())
 
-                outputs = self.model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    labels=labels
-                )
+        avg_loss = total_loss / max(1, len(val_loader))
+        logits = np.concatenate(outs, axis=0)
+        labels = np.concatenate(labs, axis=0)
+        return avg_loss, self._metrics(logits, labels)
 
-                total_val_loss += outputs.loss.item()
-                predictions.extend(outputs.logits.cpu().numpy())
-                true_labels.extend(labels.cpu().numpy())
-
-        avg_val_loss = total_val_loss / len(val_loader)
-        metrics = self.compute_metrics(np.array(predictions), np.array(true_labels))
-
-        return avg_val_loss, metrics
-
-    def save_checkpoint(self, epoch, checkpoint_dir="checkpoints"):
-        """Save model checkpoint"""
-
+    def train(self, train_loader, val_loader, epochs=EPOCHS, patience=PATIENCE, checkpoint_dir=CHECKPOINT_DIR):
         os.makedirs(checkpoint_dir, exist_ok=True)
-
-        checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_epoch_{epoch}.pt")
-
-        torch.save({
-            'epoch': epoch,
-            'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'scheduler_state_dict': self.scheduler.state_dict(),
-            'best_f1': self.best_f1,
-            'train_losses': self.train_losses,
-            'val_losses': self.val_losses,
-            'val_f1_scores': self.val_f1_scores,
-            'val_accuracies': self.val_accuracies
-        }, checkpoint_path)
-
-        logger.info(f"Checkpoint saved: {checkpoint_path}")
-
-    def early_stopping_check(self, val_f1, patience=3):
-        """Check for early stopping condition"""
-
-        if val_f1 > self.best_f1:
-            self.best_f1 = val_f1
-            self.patience_counter = 0
-            return False  # Continue training
-        else:
-            self.patience_counter += 1
-            if self.patience_counter >= patience:
-                logger.info(f"Early stopping triggered after {patience} epochs without improvement")
-                return True  # Stop training
-
-        return False
-
-    def plot_training_history(self, save_path="training_history.png"):
-        """Plot training history"""
-
-        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 10))
-
-        # Training and validation loss
-        epochs = range(1, len(self.train_losses) + 1)
-        ax1.plot(epochs, self.train_losses, 'b-', label='Training Loss')
-        ax1.plot(epochs, self.val_losses, 'r-', label='Validation Loss')
-        ax1.set_title('Training and Validation Loss')
-        ax1.set_xlabel('Epoch')
-        ax1.set_ylabel('Loss')
-        ax1.legend()
-        ax1.grid(True)
-
-        # Validation F1 Score
-        ax2.plot(epochs, self.val_f1_scores, 'g-', label='Validation F1')
-        ax2.set_title('Validation F1 Score')
-        ax2.set_xlabel('Epoch')
-        ax2.set_ylabel('F1 Score')
-        ax2.legend()
-        ax2.grid(True)
-
-        # Validation Accuracy
-        ax3.plot(epochs, self.val_accuracies, 'm-', label='Validation Accuracy')
-        ax3.set_title('Validation Accuracy')
-        ax3.set_xlabel('Epoch')
-        ax3.set_ylabel('Accuracy')
-        ax3.legend()
-        ax3.grid(True)
-
-        # All metrics combined
-        ax4.plot(epochs, self.val_f1_scores, 'g-', label='F1 Score')
-        ax4.plot(epochs, self.val_accuracies, 'm-', label='Accuracy')
-        ax4.set_title('Validation Metrics')
-        ax4.set_xlabel('Epoch')
-        ax4.set_ylabel('Score')
-        ax4.legend()
-        ax4.grid(True)
-
-        plt.tight_layout()
-        plt.savefig(save_path)
-        plt.show()
-
-        logger.info(f"Training history plot saved: {save_path}")
-
-    def train(self, train_loader, val_loader, epochs=3, patience=3,
-              checkpoint_dir="checkpoints", save_best_only=False):
-        """Main training loop with monitoring and early stopping"""
-
         logger.info("Starting training...")
-        logger.info(f"Device: {self.device}")
-        logger.info(f"Epochs: {epochs}, Patience: {patience}")
+        logger.info(f"Device: {self.device} | Epochs: {epochs} | Patience: {patience}")
+
+        scaler = torch.cuda.amp.GradScaler(enabled=(self.device.type == "cuda"))
 
         for epoch in range(epochs):
-            logger.info(f"\nEpoch {epoch + 1}/{epochs}")
-
-            # Training phase
+            logger.info(f"\nEpoch {epoch+1}/{epochs}")
             self.model.train()
-            total_train_loss = 0
+            total_train_loss = 0.0
 
-            progress_bar = tqdm(train_loader, desc=f"Training Epoch {epoch + 1}")
+            progress = tqdm(train_loader, desc=f"Training Epoch {epoch+1}")
+            for step, batch in enumerate(progress):
+                input_ids = batch["input_ids"].to(self.device)
+                attn      = batch["attention_mask"].to(self.device)
+                labels    = batch["labels"].to(self.device)
 
-            for batch_idx, batch in enumerate(progress_bar):
-                input_ids = batch['input_ids'].to(self.device)
-                attention_mask = batch['attention_mask'].to(self.device)
-                labels = batch['labels'].to(self.device)
+                self.optimizer.zero_grad(set_to_none=True)
 
-                self.optimizer.zero_grad()
+                with torch.cuda.amp.autocast(enabled=(self.device.type == "cuda")):
+                    outputs = self.model(input_ids=input_ids, attention_mask=attn, labels=labels)
+                    loss = outputs.loss
 
-                outputs = self.model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    labels=labels
-                )
-
-                loss = outputs.loss
-                loss.backward()
-
-                # Gradient clipping
+                scaler.scale(loss).backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-
-                self.optimizer.step()
+                scaler.step(self.optimizer)
+                scaler.update()
                 self.scheduler.step()
 
                 total_train_loss += loss.item()
+                progress.set_postfix({"Loss": f"{loss.item():.4f}", "Avg": f"{total_train_loss/(step+1):.4f}"})
 
-                # Update progress bar
-                progress_bar.set_postfix({
-                    'Loss': f"{loss.item():.4f}",
-                    'Avg Loss': f"{total_train_loss / (batch_idx + 1):.4f}"
-                })
+                if step % 100 == 0 and step > 0:
+                    logger.info(f"Step {step}: Current loss={loss.item():.4f}")
 
-                # Validation monitoring every few steps
-                if batch_idx % 100 == 0 and batch_idx > 0:
-                    logger.info(f"Step {batch_idx}: Current loss = {loss.item():.4f}")
+            avg_train = total_train_loss / max(1, len(train_loader))
+            self.train_losses.append(avg_train)
 
-            avg_train_loss = total_train_loss / len(train_loader)
-            self.train_losses.append(avg_train_loss)
-
-            # Validation phase
+            # Validation
             logger.info("Running validation...")
-            avg_val_loss, val_metrics = self.validate(val_loader)
+            avg_val, metrics = self._validate(val_loader)
+            self.val_losses.append(avg_val)
+            self.val_f1_scores.append(metrics["f1"])
+            self.val_accuracies.append(metrics["accuracy"])
 
-            self.val_losses.append(avg_val_loss)
-            self.val_f1_scores.append(val_metrics['f1'])
-            self.val_accuracies.append(val_metrics['accuracy'])
+            logger.info(f"Epoch {epoch+1} Results:")
+            logger.info(f"  Train Loss: {avg_train:.4f}")
+            logger.info(f"  Val Loss:   {avg_val:.4f}")
+            logger.info(f"  Val Acc:    {metrics['accuracy']:.4f}")
+            logger.info(f"  Val Prec:   {metrics['precision']:.4f}")
+            logger.info(f"  Val Recall: {metrics['recall']:.4f}")
+            logger.info(f"  Val F1:     {metrics['f1']:.4f}")
+            logger.info(f"  Val AUC:    {metrics['auc']:.4f}")
 
-            # Log metrics
-            logger.info(f"Epoch {epoch + 1} Results:")
-            logger.info(f"  Train Loss: {avg_train_loss:.4f}")
-            logger.info(f"  Val Loss: {avg_val_loss:.4f}")
-            logger.info(f"  Val Accuracy: {val_metrics['accuracy']:.4f}")
-            logger.info(f"  Val Precision: {val_metrics['precision']:.4f}")
-            logger.info(f"  Val Recall: {val_metrics['recall']:.4f}")
-            logger.info(f"  Val F1: {val_metrics['f1']:.4f}")
-            logger.info(f"  Val AUC: {val_metrics['auc']:.4f}")
+            # Save checkpoint (every epoch)
+            ckpt_path = os.path.join(checkpoint_dir, f"checkpoint_epoch_{epoch+1}.pt")
+            torch.save({
+                "epoch": epoch+1,
+                "model_state_dict": self.model.state_dict(),
+                "optimizer_state_dict": self.optimizer.state_dict(),
+                "scheduler_state_dict": self.scheduler.state_dict(),
+                "best_f1": self.best_f1,
+            }, ckpt_path)
+            logger.info(f"Checkpoint saved: {ckpt_path}")
 
-            # Save checkpoint
-            if not save_best_only or val_metrics['f1'] > self.best_f1:
-                self.save_checkpoint(epoch + 1, checkpoint_dir)
+            # Early stopping on F1
+            if metrics["f1"] > self.best_f1:
+                self.best_f1 = metrics["f1"]
+                self.patience_counter = 0
+                # also save "best so far"
+                self.model.save_pretrained(FINAL_DIR)         # lightweight save
+                self.tokenizer.save_pretrained(FINAL_DIR)
+                logger.info(f"New best F1. Model snapshot saved to {FINAL_DIR}")
+            else:
+                self.patience_counter += 1
+                if self.patience_counter >= patience:
+                    logger.info(f"Early stopping triggered (no F1 improvement in {patience} epoch(s)).")
+                    break
 
-            # Early stopping check
-            if self.early_stopping_check(val_metrics['f1'], patience):
-                logger.info("Training stopped early due to no improvement")
-                break
+        logger.info("Training complete.")
+        logger.info(f"Best validation F1: {self.best_f1:.4f}")
+        self._plot_history()
 
-        logger.info("Training completed!")
-        logger.info(f"Best validation F1 score: {self.best_f1:.4f}")
+    def _plot_history(self, save_path="/content/training_history.png"):
+        if len(self.train_losses) == 0:
+            return
+        epochs = range(1, len(self.train_losses)+1)
+        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2,2, figsize=(14,10))
+        ax1.plot(epochs, self.train_losses, label="Train Loss"); ax1.plot(epochs, self.val_losses, label="Val Loss"); ax1.legend(); ax1.grid(True); ax1.set_title("Loss")
+        ax2.plot(epochs, self.val_f1_scores, label="Val F1"); ax2.legend(); ax2.grid(True); ax2.set_title("F1")
+        ax3.plot(epochs, self.val_accuracies, label="Val Acc"); ax3.legend(); ax3.grid(True); ax3.set_title("Accuracy")
+        ax4.plot(epochs, self.val_f1_scores, label="F1"); ax4.plot(epochs, self.val_accuracies, label="Acc"); ax4.legend(); ax4.grid(True); ax4.set_title("Val Metrics")
+        plt.tight_layout(); plt.savefig(save_path); plt.show()
+        logger.info(f"Training history figure saved to {save_path}")
 
-        # Plot training history
-        self.plot_training_history()
-
-    def evaluate_test_set(self, test_loader):
-        """Evaluate model on test set"""
-
-        logger.info("Evaluating on test set...")
-
+    @torch.no_grad()
+    def evaluate(self, loader, name="Test"):
         self.model.eval()
-        predictions = []
-        true_labels = []
+        outs, labs = [], []
+        for batch in tqdm(loader, desc=f"Evaluating {name}", leave=False):
+            input_ids = batch["input_ids"].to(self.device)
+            attn      = batch["attention_mask"].to(self.device)
+            labels    = batch["labels"].to(self.device)
 
-        with torch.no_grad():
-            for batch in tqdm(test_loader, desc="Testing"):
-                input_ids = batch['input_ids'].to(self.device)
-                attention_mask = batch['attention_mask'].to(self.device)
-                labels = batch['labels'].to(self.device)
+            logits = self.model(input_ids=input_ids, attention_mask=attn).logits
+            outs.append(logits.detach().cpu().numpy()); labs.append(labels.detach().cpu().numpy())
 
-                outputs = self.model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask
-                )
+        logits = np.concatenate(outs, axis=0)
+        labels = np.concatenate(labs, axis=0)
+        metrics = self._metrics(logits, labels)
+        logger.info(f"{name} Results: Acc={metrics['accuracy']:.4f} | Prec={metrics['precision']:.4f} | "
+                    f"Rec={metrics['recall']:.4f} | F1={metrics['f1']:.4f} | AUC={metrics['auc']:.4f}")
+        # detailed report
+        preds = np.argmax(logits, axis=1)
+        print("\n" + classification_report(labels, preds, target_names=["HALLUCINATED(0)", "FACTUAL(1)"]))
+        return metrics
 
-                predictions.extend(outputs.logits.cpu().numpy())
-                true_labels.extend(labels.cpu().numpy())
-
-        test_metrics = self.compute_metrics(np.array(predictions), np.array(true_labels))
-
-        logger.info("Test Set Results:")
-        logger.info(f"  Accuracy: {test_metrics['accuracy']:.4f}")
-        logger.info(f"  Precision: {test_metrics['precision']:.4f}")
-        logger.info(f"  Recall: {test_metrics['recall']:.4f}")
-        logger.info(f"  F1: {test_metrics['f1']:.4f}")
-        logger.info(f"  AUC: {test_metrics['auc']:.4f}")
-
-        return test_metrics
-
-
+# =========================
+# Main
+# =========================
 def main():
-    """Main execution function"""
+    # Load dataset
+    pre = DataPreprocessor()
+    df  = pre.load_merged_dataset(DATASET_PATH)
 
-    # Load environment variables
-    load_dotenv()
+    # Stratified split (70/15/15)
+    train_df, val_df, test_df = pre.stratified_split(df, 0.70, 0.15, 0.15)
 
-    # Get configuration from environment variables
-    dataset_path = os.getenv('DATASET_PATH')
-    model_name = os.getenv('MODEL_NAME', 'distilbert-base-uncased')
-    batch_size = int(os.getenv('BATCH_SIZE', 8))
-    learning_rate = float(os.getenv('LEARNING_RATE', 2e-5))
-    epochs = int(os.getenv('EPOCHS', 3))
-    patience = int(os.getenv('PATIENCE', 3))
+    # Trainer
+    trainer = HallucinationDetectorTrainer(model_name=MODEL_NAME, max_length=256)
+    train_loader, val_loader, test_loader = trainer.create_loaders(train_df, val_df, test_df, batch_size=BATCH_SIZE)
+    epochs, lr = trainer.setup_optim(train_loader, epochs=EPOCHS, lr=LEARNING_RATE)
 
-    # Validate required environment variables
-    if not dataset_path:
-        raise ValueError("DATASET_PATH not found in environment variables. Please check your .env file.")
+    # Train
+    trainer.train(train_loader, val_loader, epochs=epochs, patience=PATIENCE, checkpoint_dir=CHECKPOINT_DIR)
 
-    if not os.path.exists(dataset_path):
-        raise FileNotFoundError(f"Dataset file not found at: {dataset_path}")
+    # Final evaluate on test set (using current/best snapshot on disk)
+    trainer.evaluate(test_loader, name="Test")
 
-    # Log configuration
-    logger.info("=== Training Configuration ===")
-    logger.info(f"Dataset Path: {dataset_path}")
-    logger.info(f"Model Name: {model_name}")
-    logger.info(f"Batch Size: {batch_size}")
-    logger.info(f"Learning Rate: {learning_rate}")
-    logger.info(f"Epochs: {epochs}")
-    logger.info(f"Patience: {patience}")
-    logger.info("==============================")
-
-    # Initialize preprocessor
-    preprocessor = DataPreprocessor()
-
-    logger.info(f"Loading dataset from: {dataset_path}")
-    merged_data = preprocessor.load_merged_dataset(dataset_path)
-
-    # Clean data
-    merged_data = merged_data.dropna()
-    logger.info(f"Dataset after cleaning: {len(merged_data)} samples")
-    logger.info(f"Class distribution: {merged_data['label'].value_counts().to_dict()}")
-
-    # Perform stratified split
-    train_data, val_data, test_data = preprocessor.stratified_split(merged_data)
-
-    # Initialize trainer with model from environment
-    trainer = HallucinationDetectorTrainer(model_name=model_name)
-
-    # Create data loaders with batch size from environment
-    train_loader, val_loader, test_loader = trainer.create_data_loaders(
-        train_data, val_data, test_data, batch_size=batch_size
-    )
-
-    # Initialize model
-    model = trainer.initialize_model()
-
-    # Setup optimizer and scheduler with parameters from environment
-    actual_epochs, actual_lr = trainer.setup_optimizer_scheduler(
-        train_loader, epochs=epochs, lr=learning_rate
-    )
-
-    # Train the model
-    trainer.train(
-        train_loader=train_loader,
-        val_loader=val_loader,
-        epochs=actual_epochs,
-        patience=patience,
-        checkpoint_dir="hallucination_detector_checkpoints"
-    )
-
-    # Evaluate on test set
-    test_metrics = trainer.evaluate_test_set(test_loader)
-
-    # Save final model
-    trainer.model.save_pretrained("hallucination_detector_final")
-    trainer.tokenizer.save_pretrained("hallucination_detector_final")
-
-    logger.info("Training pipeline completed successfully!")
-
+    # Save final model again (ensures latest state is persisted)
+    Path(FINAL_DIR).mkdir(parents=True, exist_ok=True)
+    trainer.model.save_pretrained(FINAL_DIR)
+    trainer.tokenizer.save_pretrained(FINAL_DIR)
+    logger.info(f"Final model saved to: {FINAL_DIR}")
 
 if __name__ == "__main__":
     main()
