@@ -287,3 +287,165 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ---
 
 **Note**: This implementation emphasizes high recall for hallucination detection, making it suitable for safety-critical applications where missing hallucinations is more costly than false alarms.
+
+
+
+# 📘 Self-Generated Counterfactual Training (SGCT)
+
+## Overview
+
+Self-Generated Counterfactual Training (SGCT) is a framework for improving language models by **teaching them to avoid hallucinations**. The method combines:
+
+* **Generator (GPT-2)** → produces multiple candidate answers.
+* **Critic (HPM)** → evaluates factual consistency of each candidate.
+* **Counterfactual Mining** → selects the best factual and worst hallucinated answers.
+* **Fine-Tuning** → retrains GPT-2 on this counterfactually curated dataset.
+
+This approach enables **self-improvement**: the model learns both **what to say** (factual) and **what not to say** (hallucinated).
+
+---
+
+## 🔄 SGCT Pipeline
+
+### 1. Input Preparation
+
+Each training example is structured as:
+
+```
+Question: <question_text>
+Evidence: <supporting_text>
+Answer:
+```
+
+* `question`: a user query.
+* `evidence`: factual supporting passage or knowledge snippet.
+* The model must generate an answer **conditioned only on the evidence**.
+
+---
+
+### 2. Candidate Generation (GPT-2)
+
+* For each prompt, GPT-2 generates `K` diverse answers.
+* Sampling uses **top-p nucleus sampling** and **temperature scaling** to encourage variability.
+* Example:
+
+  ```
+  Q: Who invented the telephone?
+  Evidence: Alexander Graham Bell is credited with inventing the telephone in 1876.
+  ```
+
+  Candidates:
+
+  * “Alexander Graham Bell in 1876.” ✅ factual
+  * “Thomas Edison invented it.” ❌ hallucinated
+  * “It is unknown who did.” ❓ borderline
+
+---
+
+### 3. Batch HPM Scoring -Mining Stage
+
+* Each candidate is scored by the **Hallucination Prediction Model (HPM)**.
+* Inputs are paired as:
+
+  ```
+  Evidence: <evidence>
+  Answer: <candidate>
+  ```
+* HPM outputs `(label, score)`:
+
+  * `label=1` → factual, `label=0` → hallucination.
+  * `score` → confidence/probability.
+
+**Batching:**
+Instead of evaluating candidates one by one, we feed batches of inputs into HPM. This:
+
+* Runs efficiently on GPU.
+* Avoids pipeline warnings about sequential calls.
+* Speeds up large-scale mining.
+
+---
+
+### 4. Counterfactual Selection
+
+For each question:
+
+* **Positive Target:** keep the **highest-scoring factual candidate** above threshold `τ_pos`.
+* **Negative Target (optional):** keep the **lowest-scoring hallucinated candidate** below threshold `τ_neg`.
+* Discard ambiguous candidates in between.
+
+Example:
+
+* “Bell (prob=0.92)” → kept as **positive**.
+* “Edison (prob=0.18)” → kept as **negative**.
+* “Unknown (prob=0.45)” → ignored.
+
+---
+
+### 5. Counterfactual Dataset
+
+The mined dataset looks like:
+
+```json
+{
+  "prompt": "Question: Who invented the telephone?\nEvidence: Bell\nAnswer:",
+  "target_pos": "Alexander Graham Bell in 1876.",
+  "target_neg": "Thomas Edison invented it."
+}
+```
+
+This provides **both supervision and anti-supervision**:
+
+* `target_pos`: factual answers to reinforce.
+* `target_neg`: hallucinations to penalize (via unlikelihood loss).
+
+---
+
+### 6. Fine-Tuning (SGCT Training)
+
+* GPT-2 is fine-tuned with `prompt → target_pos` pairs.
+* Optionally, **unlikelihood loss** penalizes generating `target_neg`.
+* Training hyperparameters (recommended):
+
+  * `MAX_LEN = 256`
+  * `BATCH_SIZE = 8`
+  * `EPOCHS = 3`
+  * `LEARNING_RATE = 2e-5`
+
+This balances stability (low learning rate) and sufficient exploration (moderate epochs/batch size).
+
+---
+
+### 7. Outcome
+
+* GPT-2 **internalizes factual patterns**: it is biased toward generating answers that align with evidence.
+* The HPM acts as a **factuality filter**, continuously steering generation toward truth.
+* Over iterations, SGCT improves robustness against hallucinations.
+
+---
+
+## 📊 Advantages of SGCT
+
+1. **Self-improving:** no need for manual annotation—HPM provides supervision.
+2. **Dual supervision:** both factual reinforcement and hallucination avoidance.
+3. **Scalable:** works with large datasets and batched mining.
+4. **Flexible:** can use any base generator (GPT-2, T5, LLaMA) and critic (DistilBERT, RoBERTa).
+
+---
+
+## ⚠️ Limitations
+
+* **Quality of HPM is critical**: if HPM mislabels, the dataset may include noisy supervision.
+* **Threshold sensitivity:** setting `τ_pos` and `τ_neg` too aggressively may reduce diversity.
+* **Computationally expensive:** requires generating and scoring many candidates per example.
+
+---
+
+## 🚀 Future Directions
+
+* Compare with existimg model to test the effectiveness of the pipeline
+
+---
+
+✅ With this pipeline, you are essentially **teaching GPT-2 by trial and error**, where HPM acts as a **teacher** filtering the model’s own mistakes into a **curriculum of counterfactual examples**.
+
+
